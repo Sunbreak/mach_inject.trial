@@ -1,23 +1,102 @@
-#include <Cocoa/Cocoa.h>
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#include <dlfcn.h>
-#include <stdio.h>
-#include <unistd.h>
+//
+//  main.m
+//  my-inject
+//
+//  Created by sun on 2024/12/3.
+//
+
+#import <Foundation/Foundation.h>
+#import <Cocoa/Cocoa.h>
+#import <mach/mach.h>
+#import <mach/mach_vm.h>
+#import <dlfcn.h>
 
 #ifdef __arm64__
 #include <ptrauth.h>
 kern_return_t (*_thread_convert_thread_state)(thread_act_t thread, int direction, thread_state_flavor_t flavor, thread_state_t in_state, mach_msg_type_number_t in_stateCnt, thread_state_t out_state, mach_msg_type_number_t *out_stateCnt);
 #endif
 
-static char *payload_path = "/Library/ScriptingAdditions/yabai.osax/Contents/Resources/payload.bundle/Contents/MacOS/payload";
+static void mach_inject(void);
+static pid_t get_dock_pid(void);
+static int add_stack_segment(mach_port_t task, uintptr_t *stack_middle_pointer);
+static int add_code_segment(mach_port_t task, uintptr_t *code_pointer);
+static int spawn_remote_thread(mach_port_t task, uintptr_t code_pointer, uintptr_t stack_middle_pointer, thread_act_t *remote_thread);
+static int check_remote_thread(thread_act_t thread);
 
-//
-// :Attribution
-//
-// The arm64e injection path is based on work by Jeremy Legendre (https://github.com/jslegendre)
-//
+int main(int argc, const char * argv[]) {
+    @autoreleasepool {
+        mach_inject();
+    }
+    return 0;
+}
 
+static void mach_inject(void) {
+    mach_port_t task = 0;
+    pid_t pid = get_dock_pid();
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
+        fprintf(stderr, "could not retrieve task port for pid: %d\n", pid);
+        return;
+    }
+
+    uintptr_t stack_middle_pointer = 0;
+    if (add_stack_segment(task, &stack_middle_pointer) != 0) {
+        return;
+    }
+    
+    uintptr_t code_pointer = 0;
+    if (add_code_segment(task, &code_pointer) != 0) {
+        return;
+    }
+
+    thread_act_t thread = 0;
+    if (spawn_remote_thread(task, code_pointer, stack_middle_pointer, &thread) != 0) {
+        return;
+    }
+
+    if (check_remote_thread(thread) != 0) {
+        return;
+    }
+}
+
+static pid_t get_dock_pid(void) {
+    NSArray *list = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"];
+
+    if (list.count == 1) {
+        NSRunningApplication *dock = list[0];
+        if ([dock isFinishedLaunching] == YES) {
+            return [dock processIdentifier];
+        }
+    }
+
+    return 0;
+}
+
+static int add_stack_segment(mach_port_t task, uintptr_t *stack_middle_pointer) {
+    mach_vm_address_t stack = 0;
+    vm_size_t stack_size = 16 * 1024;
+    uint64_t stack_contents = 0x00000000CAFEBABE;
+    if (mach_vm_allocate(task, &stack, stack_size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        fprintf(stderr, "could not allocate stack segment\n");
+        return 1;
+    }
+    
+    if (mach_vm_write(task, stack, (vm_address_t) &stack_contents, sizeof(uint64_t)) != KERN_SUCCESS) {
+        fprintf(stderr, "could not copy dummy return address into stack segment\n");
+        return 1;
+    }
+    
+    if (vm_protect(task, stack, stack_size, 1, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+        fprintf(stderr, "could not change protection for stack segment\n");
+        return 1;
+    }
+    
+    *stack_middle_pointer = stack + (stack_size / 2);
+    return 0;
+}
+
+#pragma mark add_code_segment
+
+static char *payload_path = "/Users/sunbreak/w/Sunbreak/mach_inject.trial/payload/payload";
 static char shell_code[] =
 #ifdef __x86_64__
 "\x55"                             // push       rbp
@@ -104,95 +183,55 @@ static char shell_code[] =
 "\x00\x00\x00\x00\x00\x00\x00\x00"
 "\x00\x00\x00\x00\x00\x00\x00\x00";
 
-static pid_t get_dock_pid(void)
-{
-    NSArray *list = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"];
-
-    if (list.count == 1) {
-        NSRunningApplication *dock = list[0];
-        if ([dock isFinishedLaunching] == YES) {
-            return [dock processIdentifier];
-        }
-    }
-
-    return 0;
-}
-
-int main(int argc, char **argv)
-{
-    int result = 0;
-    mach_port_t task = 0;
-    thread_act_t thread = 0;
+static int add_code_segment(mach_port_t task, uintptr_t *code_pointer) {
     mach_vm_address_t code = 0;
-    mach_vm_address_t stack = 0;
-    vm_size_t stack_size = 16 * 1024;
-    uint64_t stack_contents = 0x00000000CAFEBABE;
-    pid_t pid = get_dock_pid();
-
-    if (!pid) {
-        fprintf(stderr, "could not locate Dock.app pid\n");
-        return 1;
-    }
-
-    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
-        fprintf(stderr, "could not retrieve task port for pid: %d\n", pid);
-        return 1;
-    }
-
-    if (mach_vm_allocate(task, &stack, stack_size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
-        fprintf(stderr, "could not allocate stack segment\n");
-        return 1;
-    }
-
-    if (mach_vm_write(task, stack, (vm_address_t) &stack_contents, sizeof(uint64_t)) != KERN_SUCCESS) {
-        fprintf(stderr, "could not copy dummy return address into stack segment\n");
-        return 1;
-    }
-
-    if (vm_protect(task, stack, stack_size, 1, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
-        fprintf(stderr, "could not change protection for stack segment\n");
-        return 1;
-    }
-
     if (mach_vm_allocate(task, &code, sizeof(shell_code), VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
         fprintf(stderr, "could not allocate code segment\n");
         return 1;
     }
-
+    
 #ifdef __x86_64__
     uint64_t pcfmt_address = (uint64_t) dlsym(RTLD_DEFAULT, "pthread_create_from_mach_thread");
     uint64_t dlopen_address = (uint64_t) dlsym(RTLD_DEFAULT, "dlopen");
-
+    
     memcpy(shell_code + 28, &pcfmt_address, sizeof(uint64_t));
     memcpy(shell_code + 71, &dlopen_address, sizeof(uint64_t));
     memcpy(shell_code + 90, payload_path, strlen(payload_path));
 #elif __arm64__
     uint64_t pcfmt_address = (uint64_t) ptrauth_strip(dlsym(RTLD_DEFAULT, "pthread_create_from_mach_thread"), ptrauth_key_function_pointer);
     uint64_t dlopen_address = (uint64_t) ptrauth_strip(dlsym(RTLD_DEFAULT, "dlopen"), ptrauth_key_function_pointer);
-
+    
     memcpy(shell_code + 88, &pcfmt_address, sizeof(uint64_t));
     memcpy(shell_code + 160, &dlopen_address, sizeof(uint64_t));
     memcpy(shell_code + 168, payload_path, strlen(payload_path));
 #endif
-
+    
     if (mach_vm_write(task, code, (vm_address_t) shell_code, sizeof(shell_code)) != KERN_SUCCESS) {
         fprintf(stderr, "could not copy shellcode into code segment\n");
         return 1;
     }
-
+    
     if (vm_protect(task, code, sizeof(shell_code), 0, VM_PROT_EXECUTE | VM_PROT_READ) != KERN_SUCCESS) {
         fprintf(stderr, "could not change protection for code segment\n");
         return 1;
     }
+    
+    *code_pointer = code;
+    return 0;
+}
 
+#pragma mark spawn_remote_thread
+
+static int spawn_remote_thread(mach_port_t task, uintptr_t code_pointer, uintptr_t stack_middle_pointer, thread_act_t *child_thread) {
+    thread_act_t thread = 0;
 #ifdef __x86_64__
     x86_thread_state64_t thread_state = {};
     thread_state_flavor_t thread_flavor = x86_THREAD_STATE64;
     mach_msg_type_number_t thread_flavor_count = x86_THREAD_STATE64_COUNT;
-
-    thread_state.__rip = (uint64_t) code;
-    thread_state.__rsp = (uint64_t) stack + (stack_size / 2);
-
+    
+    thread_state.__rip = (uint64_t) code_pointer;
+    thread_state.__rsp = (uint64_t) stack_middle_pointer;
+    
     kern_return_t error = thread_create_running(task, thread_flavor, (thread_state_t)&thread_state, thread_flavor_count, &thread);
     if (error != KERN_SUCCESS) {
         fprintf(stderr, "could not spawn remote thread: %s\n", mach_error_string(error));
@@ -204,34 +243,34 @@ int main(int argc, char **argv)
         _thread_convert_thread_state = dlsym(handle, "thread_convert_thread_state");
         dlclose(handle);
     }
-
+    
     if (!_thread_convert_thread_state) {
         fprintf(stderr, "could not load symbol: thread_convert_thread_state\n");
         return 1;
     }
-
+    
     arm_thread_state64_t thread_state = {}, machine_thread_state = {};
     thread_state_flavor_t thread_flavor = ARM_THREAD_STATE64;
     mach_msg_type_number_t thread_flavor_count = ARM_THREAD_STATE64_COUNT, machine_thread_flavor_count = ARM_THREAD_STATE64_COUNT;
-
-    __darwin_arm_thread_state64_set_pc_fptr(thread_state, ptrauth_sign_unauthenticated((void *) code, ptrauth_key_asia, 0));
-    __darwin_arm_thread_state64_set_sp(thread_state, stack + (stack_size / 2));
-
+    
+    __darwin_arm_thread_state64_set_pc_fptr(thread_state, ptrauth_sign_unauthenticated((void *) code_pointer, ptrauth_key_asia, 0));
+    __darwin_arm_thread_state64_set_sp(thread_state, stack_middle_pointer);
+    
     kern_return_t error = thread_create(task, &thread);
     if (error != KERN_SUCCESS) {
         fprintf(stderr, "could not create remote thread: %s\n", mach_error_string(error));
         return 1;
     }
-
+    
     error = _thread_convert_thread_state(thread, 2, thread_flavor, (thread_state_t) &thread_state, thread_flavor_count, (thread_state_t) &machine_thread_state, &machine_thread_flavor_count);
     if (error != KERN_SUCCESS) {
         fprintf(stderr, "could not convert thread state: %s\n", mach_error_string(error));
         return 1;
     }
-
+    
     NSOperatingSystemVersion os_version = [[NSProcessInfo processInfo] operatingSystemVersion];
     if ((os_version.majorVersion == 14 && os_version.minorVersion >= 4) ||
-        (os_version.majorVersion == 15)) {
+        (os_version.majorVersion == 15) || (os_version.majorVersion == 13)) {
         thread_terminate(thread);
         error = thread_create_running(task, thread_flavor, (thread_state_t)&machine_thread_state, machine_thread_flavor_count, &thread);
         if (error != KERN_SUCCESS) {
@@ -244,7 +283,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "could not set thread state: %s\n", mach_error_string(error));
             return 1;
         }
-
+        
         error = thread_resume(thread);
         if (error != KERN_SUCCESS) {
             fprintf(stderr, "could not resume remote thread: %s\n", mach_error_string(error));
@@ -252,34 +291,47 @@ int main(int argc, char **argv)
         }
     }
 #endif
+    
+    *child_thread = thread;
+    return 0;
+}
 
-    usleep(10000);
-
+static int check_remote_thread(thread_act_t thread) {
+    int result = 0;
+    
+#ifdef __x86_64__
+    x86_thread_state64_t thread_state = {};
+    thread_state_flavor_t thread_flavor = x86_THREAD_STATE64;
+    mach_msg_type_number_t thread_flavor_count = x86_THREAD_STATE64_COUNT;
+#elif __arm64__
+    arm_thread_state64_t thread_state = {};
+    thread_state_flavor_t thread_flavor = ARM_THREAD_STATE64;
+    mach_msg_type_number_t thread_flavor_count = ARM_THREAD_STATE64_COUNT;
+#endif
+    
     for (int i = 0; i < 10; ++i) {
-        kern_return_t error = thread_get_state(thread, thread_flavor, (thread_state_t)&thread_state, &thread_flavor_count);
-
-        if (error != KERN_SUCCESS) {
+        if (thread_get_state(thread, thread_flavor, (thread_state_t)&thread_state, &thread_flavor_count) != KERN_SUCCESS) {
             result = 1;
-            goto terminate;
+            break;
         }
-
+        
+        // check "yabe"
 #ifdef __x86_64__
         if (thread_state.__rax == 0x79616265) {
 #elif __arm64__
         if (thread_state.__x[0] == 0x79616265) {
 #endif
             result = 0;
-            goto terminate;
+            break;
         }
-
+        
         usleep(20000);
     }
-
-terminate:
-    error = thread_terminate(thread);
+    
+    kern_return_t error = thread_terminate(thread);
     if (error != KERN_SUCCESS) {
         fprintf(stderr, "failed to terminate remote thread: %s\n", mach_error_string(error));
     }
-
+    
     return result;
 }
