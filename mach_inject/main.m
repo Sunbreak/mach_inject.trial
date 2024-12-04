@@ -10,6 +10,7 @@
 #import <mach/mach.h>
 #import <mach/mach_vm.h>
 #import <dlfcn.h>
+#import <unistd.h>
 
 #ifdef __arm64__
 #include <ptrauth.h>
@@ -96,7 +97,7 @@ static int add_stack_segment(mach_port_t task, uintptr_t *stack_middle_pointer) 
 
 #pragma mark add_code_segment
 
-static char *payload_path = "/Users/sunbreak/w/Sunbreak/mach_inject.trial/payload/payload";
+static char payload_path[100];
 static char shell_code[] =
 #ifdef __x86_64__
 "\x55"                             // push       rbp
@@ -190,6 +191,13 @@ static int add_code_segment(mach_port_t task, uintptr_t *code_pointer) {
         return 1;
     }
     
+    char cwd[100];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        perror("getcwd() error");
+        return 1;
+    }
+    sprintf(payload_path, "%s/payload/payload", cwd);
+
 #ifdef __x86_64__
     uint64_t pcfmt_address = (uint64_t) dlsym(RTLD_DEFAULT, "pthread_create_from_mach_thread");
     uint64_t dlopen_address = (uint64_t) dlsym(RTLD_DEFAULT, "dlopen");
